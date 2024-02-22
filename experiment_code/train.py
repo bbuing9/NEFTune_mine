@@ -24,10 +24,68 @@ from dataset import make_supervised_data_module
 from accelerate.data_loader import skip_first_batches
 import wandb
 
+import numpy as np 
+
+# Added by JK
+from childoptim import ChildTuningAdamW
+from RecAdam import RecAdam
+
 from utils import (get_fsdp_wrapped_empty_model, load_model_opt_scheduler_states_fsdp, 
                    load_state_dict_fsdp, save_model_opt_scheduler_states_fsdp,
                    add_padding_token
                    )
+
+def calculate_fisher(args, model, dataloader):
+    '''
+    Calculate Fisher Information for different parameters
+    '''
+    gradient_mask = dict()
+    model.train()
+
+    for name, params in model.named_parameters():
+        if 'layer' in name:
+            gradient_mask[params] = params.new_zeros(params.size())
+    
+    N = len(dataloader)
+    epoch_iterator = iter(dataloader)
+    for step_count in range(10):#(int(0. * args.max_steps)):
+        train_loss = 0
+        for _ in range(args.accumulation_steps):
+            try:
+                data = next(epoch_iterator)
+            except StopIteration:
+                sampler.set_epoch(sampler.epoch + 1)
+                dataloader = dataloader_full
+                epoch_iterator = iter(dataloader)
+                data = next(epoch_iterator)
+
+            out = model(**data)
+
+            (out.loss/args.accumulation_steps).backward()
+
+        for name, params in model.named_parameters():
+            if 'layer' in name:
+                torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+                gradient_mask[params] += (params.grad ** 2) / N
+        model.zero_grad()
+
+    print('Calculate Fisher Information')
+
+    # Numpy
+    r = None
+    for k, v in gradient_mask.items():
+        v = v.view(-1).cpu().float().numpy()
+        if r is None:
+            r = v
+        else:
+            r = np.append(r, v)
+    polar = np.percentile(r, (1-args.reverse_p)*100)
+    #for k, v in gradient_mask.items():
+    #    polar = torch.quantile(v.reshape(-1).float(), (1-args.reverse_p), interpolation='lower')
+    #    gradient_mask[k] = gradient_mask[k] > polar
+    #print('Polar => {}'.format(polar))
+    
+    return gradient_mask
 
 def setup(rank, world_size, port):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -44,9 +102,40 @@ def get_empty_model(model_config_path, add_tokens=1, wrapped_class=None, hack=Fa
     model_config.vocab_size += add_tokens
     return get_fsdp_wrapped_empty_model(model_config, wrapped_class, hack=hack)
 
-def get_model_opt_scheduler(added_tokens, model_config_path, max_steps=1000, warmup_ratio=0.03, weight_decay=0.0, lr=2e-5, wrapped_class=None, hack=False):
+def get_model_opt_scheduler(added_tokens, model_config_path, max_steps=1000, warmup_ratio=0.03, weight_decay=0.0, lr=2e-5, wrapped_class=None, hack=False, args=None):
     model = get_empty_model(model_config_path, add_tokens=added_tokens, wrapped_class=wrapped_class, hack=hack)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    if args.linear:
+        #print(model)
+        opt = torch.optim.AdamW(model.model.embed_tokens.parameters(), lr=lr, weight_decay=weight_decay)    
+    elif args.rec_adam != 'None':
+        orig_weights = dict()
+        
+        for name, params in model.named_parameters():
+            #if 'layer' in name:
+            orig_weights[params] = params.clone().data
+        '''
+        optimizer_grouped_parameters = [
+            {
+                "params": model.parameters(), #[p for n, p in model.named_parameters()],
+                "weight_decay": weight_decay,
+                "anneal_w": 1.0,
+                "pretrain_params": [p_p.clone() for p_n, p_p in model.named_parameters()]
+            }
+        ]
+        '''
+        opt = RecAdam(model.parameters(), lr=lr, anneal_fun=args.rec_adam, anneal_k=args.recadam_anneal_k,
+                        anneal_t0=args.recadam_anneal_t0, pretrain_cof=args.recadam_pretrain_cof)
+        opt.set_orig_weights(orig_weights)  
+        #opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif args.child_f or args.child_d:
+        if args.child_f:
+            mode = 'ChildTuning-F'
+        else:
+            mode = 'ChildTuning-D'
+        opt = ChildTuningAdamW(model.parameters(), mode=mode, lr=lr, reserve_p=args.reverse_p)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = get_cosine_schedule_with_warmup(opt, int(max_steps*warmup_ratio), num_training_steps=max_steps)
     return model, opt, scheduler
     
@@ -90,7 +179,7 @@ def fsdp_main(rank, world_size, args):
         model_config_path=args.model_config_path,
         max_steps=args.max_steps, warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay, lr=args.lr,
-        wrapped_class=wrapped_class, hack=args.hack)
+        wrapped_class=wrapped_class, hack=args.hack, args=args)
     if args.resume:
         model, opt, scheduler, start_step_count = load_model_opt_scheduler_states_fsdp(model, opt, scheduler, args.checkpoint_path)
     else:
@@ -129,6 +218,11 @@ def fsdp_main(rank, world_size, args):
     save_steps = args.save_steps
     epoch_iterator = iter(dataloader)
     start_time = time.time()
+
+    if args.child_d and args.reverse_p > 0:
+        gradient_mask = calculate_fisher(args, model, dataloader)
+        opt.set_gradient_mask(gradient_mask)  
+        
     for step_count in range(start_step_count, args.max_steps):
         train_loss = 0
         for _ in range(accumulation_steps):
@@ -182,6 +276,7 @@ def fsdp_main(rank, world_size, args):
         opt.step()
         scheduler.step()
         opt.zero_grad()
+        print(opt.orig_weights)
 
         # save the model, optimizer, scheduler
         if (step_count+1) % save_steps == 0 or (step_count+1) == args.max_steps:
@@ -218,7 +313,7 @@ if __name__ == '__main__':
     parser.add_argument("--max_grad_norm", type=float, default=1)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--act_checkpointing", action='store_true')
-    parser.add_argument("--save_steps", type=int, default=(52002*3/128)//10)
+    parser.add_argument("--save_steps", type=int, default=(52002*3/128)//2)
     parser.add_argument("--accumulation_steps", type=int, default=32)
     parser.add_argument("--neftune_alpha", type=float, default=None)
 
@@ -226,6 +321,19 @@ if __name__ == '__main__':
     parser.add_argument("--wandb", action='store_true')
     parser.add_argument("--wb_project", type=str, default="data_instruct")
     parser.add_argument("--wb_name", type=str, default="test")
+
+    # added by JK
+    parser.add_argument("--linear", action='store_true')
+    
+    parser.add_argument("--rec_adam", type=str, default="None")
+    parser.add_argument("--recadam_anneal_t0", type=int, default=(52002*3/128)//1)
+    parser.add_argument("--recadam_anneal_k", type=float, default=0.0)
+    parser.add_argument("--recadam_pretrain_cof", type=float, default=5000.0)
+
+    parser.add_argument("--child_d", action='store_true')
+    parser.add_argument("--child_f", action='store_true')
+    parser.add_argument("--reverse_p", type=float, default=0.1)
+    
     args = parser.parse_args()
 
     WORLD_SIZE = torch.cuda.device_count()

@@ -5,7 +5,7 @@ import json
 import random
 
 import torch
-import torch.nn
+import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -250,8 +250,9 @@ def fsdp_main(rank, world_size, args):
                 logits = out.logits # B x L x V 
                 vocab_size = out.logits.shape[-1]
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size) # B(L-1) x V
-                sorted_logits, _ = torch.sort(shift_logits)[:, :args.num_trim]
-                sorted_targets = sorted_targets.softmax(dim=-1)
+                sorted_logits, _ = torch.sort(shift_logits)
+                sorted_logits = sorted_logits[:, :args.num_trim]
+                sorted_targets = sorted_logits.softmax(dim=-1)
                 kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
                 total_loss = out.loss + args.self_kd * kd_loss
             else:

@@ -5,6 +5,7 @@ import json
 import random
 
 import torch
+import torch.nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -13,6 +14,8 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import DataLoader
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+
 import transformers
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.opt.modeling_opt import OPTDecoderLayer
@@ -48,7 +51,7 @@ def calculate_fisher(args, model, dataloader):
     
     N = len(dataloader)
     epoch_iterator = iter(dataloader)
-    for step_count in range(10):#(int(0. * args.max_steps)):
+    for step_count in range(int(03. * args.max_steps)):
         train_loss = 0
         for _ in range(args.accumulation_steps):
             try:
@@ -80,10 +83,10 @@ def calculate_fisher(args, model, dataloader):
         else:
             r = np.append(r, v)
     polar = np.percentile(r, (1-args.reverse_p)*100)
-    #for k, v in gradient_mask.items():
+    for k, v in gradient_mask.items():
     #    polar = torch.quantile(v.reshape(-1).float(), (1-args.reverse_p), interpolation='lower')
-    #    gradient_mask[k] = gradient_mask[k] > polar
-    #print('Polar => {}'.format(polar))
+        gradient_mask[k] = gradient_mask[k] > polar
+    print('Polar => {}'.format(polar))
     
     return gradient_mask
 
@@ -109,25 +112,8 @@ def get_model_opt_scheduler(added_tokens, model_config_path, max_steps=1000, war
         #print(model)
         opt = torch.optim.AdamW(model.model.embed_tokens.parameters(), lr=lr, weight_decay=weight_decay)    
     elif args.rec_adam != 'None':
-        orig_weights = dict()
-        
-        for name, params in model.named_parameters():
-            #if 'layer' in name:
-            orig_weights[params] = params.clone().data
-        '''
-        optimizer_grouped_parameters = [
-            {
-                "params": model.parameters(), #[p for n, p in model.named_parameters()],
-                "weight_decay": weight_decay,
-                "anneal_w": 1.0,
-                "pretrain_params": [p_p.clone() for p_n, p_p in model.named_parameters()]
-            }
-        ]
-        '''
         opt = RecAdam(model.parameters(), lr=lr, anneal_fun=args.rec_adam, anneal_k=args.recadam_anneal_k,
                         anneal_t0=args.recadam_anneal_t0, pretrain_cof=args.recadam_pretrain_cof)
-        opt.set_orig_weights(orig_weights)  
-        #opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     elif args.child_f or args.child_d:
         if args.child_f:
             mode = 'ChildTuning-F'
@@ -222,7 +208,13 @@ def fsdp_main(rank, world_size, args):
     if args.child_d and args.reverse_p > 0:
         gradient_mask = calculate_fisher(args, model, dataloader)
         opt.set_gradient_mask(gradient_mask)  
-        
+    
+    if args.rec_adam != 'None':
+        orig_weights = dict()
+        for name, params in model.named_parameters():
+            orig_weights[params] = params.clone().data
+        opt.set_orig_weights(orig_weights)  
+
     for step_count in range(start_step_count, args.max_steps):
         train_loss = 0
         for _ in range(accumulation_steps):
@@ -253,9 +245,19 @@ def fsdp_main(rank, world_size, args):
                     ### add noise to embeds
 
             out = model(**data)
-
-            (out.loss/accumulation_steps).backward()
-            train_loss += out.loss.item()/accumulation_steps
+            if args.self_kd > 0:
+                kd_loss_ftn = nn.CrossEntropyLoss()
+                logits = out.logits # B x L x V 
+                vocab_size = out.logits.shape[-1]
+                shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size) # B(L-1) x V
+                sorted_logits, _ = torch.sort(shift_logits)[:, :args.num_trim]
+                sorted_targets = sorted_targets.softmax(dim=-1)
+                kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
+                total_loss = out.loss + args.self_kd * kd_loss
+            else:
+                total_loss = out.loss
+            (total_loss/accumulation_steps).backward()
+            train_loss += total_loss.item()/accumulation_steps
         model.clip_grad_norm_(args.max_grad_norm)
         if rank == 0:
             time_so_far = (time.time() - start_time)/ 3600
@@ -276,7 +278,6 @@ def fsdp_main(rank, world_size, args):
         opt.step()
         scheduler.step()
         opt.zero_grad()
-        print(opt.orig_weights)
 
         # save the model, optimizer, scheduler
         if (step_count+1) % save_steps == 0 or (step_count+1) == args.max_steps:
@@ -333,7 +334,10 @@ if __name__ == '__main__':
     parser.add_argument("--child_d", action='store_true')
     parser.add_argument("--child_f", action='store_true')
     parser.add_argument("--reverse_p", type=float, default=0.1)
-    
+
+    parser.add_argument("--self_kd", type=float, default=0.0)
+    parser.add_argument("--num_trim", type=int, default=100)    
+
     args = parser.parse_args()
 
     WORLD_SIZE = torch.cuda.device_count()

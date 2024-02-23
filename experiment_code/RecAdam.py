@@ -29,9 +29,9 @@ def anneal_function(function, step, k, t0, weight):
     if function == 'sigmoid':
         return float(1 / (1 + np.exp(-k * (step - t0)))) * weight
     elif function == 'linear':
-        return min(1, step / t0) * weight
+        return min(0.5, step / t0) * weight
     elif function == 'constant':
-        return weight
+        return 0.5 * weight
     else:
         ValueError
 
@@ -65,6 +65,7 @@ class RecAdam(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, correct_bias=correct_bias,
                         anneal_fun=anneal_fun, anneal_k=anneal_k, anneal_t0=anneal_t0, anneal_w=anneal_w,
                         pretrain_cof=pretrain_cof, pretrain_params=pretrain_params)
+        #print(pretrain_cof)
         super().__init__(params, defaults)
 
     def set_orig_weights(self, orig_weights):

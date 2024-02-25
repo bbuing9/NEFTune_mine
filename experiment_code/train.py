@@ -51,7 +51,7 @@ def calculate_fisher(args, model, dataloader):
     
     N = len(dataloader)
     epoch_iterator = iter(dataloader)
-    for step_count in range(int(03. * args.max_steps)):
+    for step_count in range(int(0.1 * args.max_steps)):
         train_loss = 0
         for _ in range(args.accumulation_steps):
             try:
@@ -250,10 +250,11 @@ def fsdp_main(rank, world_size, args):
                 logits = out.logits # B x L x V 
                 vocab_size = out.logits.shape[-1]
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size) # B(L-1) x V
-                sorted_logits, _ = torch.sort(shift_logits)
-                sorted_logits = sorted_logits[:, :args.num_trim]
-                sorted_targets = sorted_logits.softmax(dim=-1)
-                kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
+                shift_targets = logits[..., 1:, :].contiguous().view(-1, vocab_size)
+                sorted_targets, _ = torch.sort(shift_targets, descending=True)
+                sorted_targets = sorted_targets[:, :args.num_trim]
+                sorted_targets = sorted_targets.softmax(dim=-1)
+                kd_loss = kd_loss_ftn(sorted_logits[:, :args.num_trim], sorted_targets)
                 total_loss = out.loss + args.self_kd * kd_loss
             else:
                 total_loss = out.loss

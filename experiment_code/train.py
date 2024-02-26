@@ -251,10 +251,14 @@ def fsdp_main(rank, world_size, args):
                 vocab_size = out.logits.shape[-1]
                 shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size) # B(L-1) x V
                 shift_targets = logits[..., 1:, :].contiguous().view(-1, vocab_size)
-                sorted_targets, _ = torch.sort(shift_targets, descending=True)
+
+                sorted_targets, sorted_indices = torch.sort(shift_targets, descending=True)
+                rows = torch.arange(shift_logits.size(0)).unsqueeze(-1).expand(-1, args.num_trim)
+                sorted_logits = shift_logits[rows, sorted_indices[:, :args.num_trim]] # B(L-1) x V
+
                 sorted_targets = sorted_targets[:, :args.num_trim]
                 sorted_targets = sorted_targets.softmax(dim=-1)
-                kd_loss = kd_loss_ftn(sorted_logits[:, :args.num_trim], sorted_targets)
+                kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
                 total_loss = out.loss + args.self_kd * kd_loss
             else:
                 total_loss = out.loss

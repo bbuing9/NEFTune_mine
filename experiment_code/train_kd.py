@@ -23,7 +23,7 @@ from transformers.trainer_utils import seed_worker
 
 from transformers.optimization import get_cosine_schedule_with_warmup
 from lion_pytorch import Lion
-from dataset import make_supervised_data_module
+from dataset_kd import make_supervised_data_module
 from accelerate.data_loader import skip_first_batches
 import wandb
 
@@ -240,7 +240,7 @@ def fsdp_main(rank, world_size, args):
         )
     add_padding_token(tokenizer)
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_path=args.data_path, data_fraction=args.data_fraction, seed=args.sample_seed)
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_path=args.data_path, prob_path=args.prob_path, data_fraction=args.data_fraction, seed=args.sample_seed)
     train_dataset = data_module['train_dataset']
     data_collator = data_module['data_collator']
     dataloader_full, sampler = get_dataloader_and_sampler(train_dataset=train_dataset, data_collator=data_collator, batch_size=args.batch_size, rank=rank, world_size=world_size)
@@ -273,16 +273,17 @@ def fsdp_main(rank, world_size, args):
         train_loss = 0
         for _ in range(accumulation_steps):
             try:
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
             except StopIteration:
                 sampler.set_epoch(sampler.epoch + 1)
                 dataloader = dataloader_full
                 epoch_iterator = iter(dataloader)
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
 
+            data, data2 = data_orig
+            embed_device = model._fsdp_wrapped_module.model.embed_tokens.weight.device
             if args.neftune_alpha is not None:
                 if isinstance(model, torch.distributed.fsdp.fully_sharded_data_parallel.FullyShardedDataParallel):
-                    embed_device = model._fsdp_wrapped_module.model.embed_tokens.weight.device
                     embeds_init = model._fsdp_wrapped_module.model.embed_tokens.forward(data['input_ids'].to(embed_device))
 
                     ### add noise to embeds
@@ -303,13 +304,16 @@ def fsdp_main(rank, world_size, args):
                 kd_loss_ftn = nn.CrossEntropyLoss()
                 logits = out.logits # B x L x V 
                 vocab_size = out.logits.shape[-1]
-                shift_logits = logits[..., :-1, :].contiguous().view(-1, vocab_size) # B(L-1) x V
-                shift_targets = logits[..., 1:, :].contiguous().view(-1, vocab_size)
+                shift_logits = logits[..., :-1, :].contiguous()
 
-                sorted_targets, sorted_indices = torch.sort(shift_targets, descending=True)
-                rows = torch.arange(shift_logits.size(0)).unsqueeze(-1).expand(-1, args.num_trim)
-                sorted_logits = shift_logits[rows, sorted_indices[:, :args.num_trim]] # B(L-1) x V
+                rows = torch.arange(shift_logits.size(0)).unsqueeze(-1).unsqueeze(-1).expand(-1, shift_logits.size(1), 100)
+                cols = torch.arange(shift_logits.size(1)).unsqueeze(0).unsqueeze(-1).expand(shift_logits.size(0), -1, 100)
 
+                selected_indices = data2['indices'].to(embed_device)[:, :shift_logits.size(1)]
+                selected_logit = shift_logits[rows, cols, selected_indices].view(-1, 100)[:, :args.num_trim] # B(L-1) x V
+
+                sorted_targets = data2['probs'][:, :shift_logits.size(1)].reshape(-1, 100).to(embed_device)
+                
                 sorted_targets = sorted_targets[:, :args.num_trim]
                 sorted_targets = sorted_targets.softmax(dim=-1)
 
@@ -317,8 +321,6 @@ def fsdp_main(rank, world_size, args):
                     shift_labels = data['labels'][..., 1:].contiguous().view(-1)
                     selected_probs = shift_logits.softmax(dim=-1)[torch.arange(len(shift_labels)), shift_labels]
                     mask_p = (selected_probs > args.mask_p)
-                    #print(len(selected_probs))
-                    #print(sum(mask_p))
                     kd_loss = kd_loss_ftn(sorted_logits[mask_p], sorted_targets[mask_p]) * (sum(mask_p) / len(selected_probs))
                 else:
                     kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
@@ -407,7 +409,7 @@ if __name__ == '__main__':
     parser.add_argument("--self_kd", type=float, default=0.0)
     parser.add_argument("--num_trim", type=int, default=100)    
 
-    # Ours 
+    parser.add_argument("--prob_path", type=str, default="checkpoints/full_prob") 
     parser.add_argument("--select", type=str, default="cap", help="cap|sub")
     parser.add_argument("--mask_p", type=float, default=0.0)
     

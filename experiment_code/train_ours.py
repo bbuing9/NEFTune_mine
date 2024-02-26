@@ -312,7 +312,14 @@ def fsdp_main(rank, world_size, args):
 
                 sorted_targets = sorted_targets[:, :args.num_trim]
                 sorted_targets = sorted_targets.softmax(dim=-1)
-                kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
+
+                if args.mask_p > 0:
+                    shift_labels = data['labels'][..., 1:].contiguous().view(-1)
+                    selected_probs = shift_logits.softmax(dim=-1)[torch.arange(len(shift_labels)), shift_labels]
+                    mask_p = (selected_probs > args.mask_p)
+                    kd_loss = kd_loss_ftn(sorted_logits[mask_p], sorted_targets[mask_p])
+                else:
+                    kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
                 total_loss = out.loss + args.self_kd * kd_loss
             else:
                 total_loss = out.loss
@@ -400,6 +407,7 @@ if __name__ == '__main__':
 
     # Ours 
     parser.add_argument("--select", type=str, default="cap", help="cap|sub")
+    parser.add_argument("--mask_p", type=float, default=0.0)
     
     args = parser.parse_args()
 

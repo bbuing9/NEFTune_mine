@@ -321,9 +321,9 @@ def fsdp_main(rank, world_size, args):
                     shift_labels = data['labels'][..., 1:].contiguous().view(-1)
                     selected_probs = shift_logits.softmax(dim=-1)[torch.arange(len(shift_labels)), shift_labels]
                     mask_p = (selected_probs > args.mask_p)
-                    kd_loss = kd_loss_ftn(sorted_logits[mask_p], sorted_targets[mask_p]) * (sum(mask_p) / len(selected_probs))
+                    kd_loss = kd_loss_ftn(selected_logit[mask_p], sorted_targets[mask_p]) * (sum(mask_p) / len(selected_probs))
                 else:
-                    kd_loss = kd_loss_ftn(sorted_logits, sorted_targets)
+                    kd_loss = kd_loss_ftn(selected_logit, sorted_targets)
                 total_loss = out.loss + args.self_kd * kd_loss
             else:
                 total_loss = out.loss

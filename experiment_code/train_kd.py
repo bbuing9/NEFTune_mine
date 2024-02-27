@@ -59,12 +59,14 @@ def calculate_fisher(args, model, dataloader):
         train_loss = 0
         for _ in range(args.accumulation_steps):
             try:
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
             except StopIteration:
                 sampler.set_epoch(sampler.epoch + 1)
                 dataloader = dataloader_full
                 epoch_iterator = iter(dataloader)
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
+
+            data, data2 = data_orig
 
             out = model(**data)
 
@@ -83,12 +85,14 @@ def calculate_fisher(args, model, dataloader):
         train_loss = 0
         for _ in range(args.accumulation_steps):
             try:
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
             except StopIteration:
                 sampler.set_epoch(sampler.epoch + 1)
                 dataloader = dataloader_full
                 epoch_iterator = iter(dataloader)
-                data = next(epoch_iterator)
+                data_orig = next(epoch_iterator)
+
+            data, data2 = data_orig
 
             out = model(**data)
             logits = out.logits # B x L x V 
